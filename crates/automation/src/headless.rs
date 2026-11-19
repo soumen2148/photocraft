@@ -72,8 +72,10 @@ impl Headless {
     /// not a remote automation client, supplies these host paths. Nested
     /// `actions.play` steps are not re-checked: this caller is already trusted.
     pub fn trusted_local() -> Self {
+        let mut session = Session::new();
+        session.segmentation = crate::ai_segment::default_backend();
         Self {
-            session: Session::new(),
+            session,
             writers: HashMap::new(),
             filesystem: Filesystem::TrustedLocal,
             renderer: None,

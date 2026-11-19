@@ -19,6 +19,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod agent_link;
+pub mod ai_segment;
 pub mod app_dirs;
 pub mod args;
 pub mod bridge;

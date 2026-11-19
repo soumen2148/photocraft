@@ -9,6 +9,7 @@
 
 mod actions_record;
 pub mod adjust_params;
+pub mod ai_segment;
 mod allocation;
 pub mod build_info;
 mod canvas_geom;
@@ -294,6 +295,8 @@ pub struct Session {
     /// The printers `file.printers`, `file.print.printers` and the Print dialog list in place of
     /// the system's (tests); see `print_cmds::PrinterSource`. `None` asks the spooler.
     pub printer_source: Option<print_cmds::PrinterSource>,
+    /// Optional local/remote ML segmentation backend (#2788).
+    pub segmentation: Option<Arc<dyn ai_segment::SegmentationBackend>>,
     /// Background jobs (see [`jobs`]).
     jobs: jobs::Jobs,
     /// Color Sampler points dropped by the last canvas-size change (crop, Canvas Size, Image Size,

@@ -12,6 +12,7 @@ use photocraft_doc::{Document, Layer, LayerContent, LayerId, LayerMask};
 use photocraft_geom::Rect;
 use serde_json::{Value, json};
 
+use crate::ai_segment::{self, BackendChoice};
 use crate::commands::CommandSpec;
 use crate::select_mask_edits;
 use crate::{EngineError, Result, Session};
@@ -364,23 +365,53 @@ fn object_edge<'a>(canvas: Rect, p: &Value, region: Option<&'a Region>) -> Optio
     Some(if b(p, "hardEdge", true) { Cow::Borrowed(region) } else { Cow::Owned(soften_edge(region, canvas)) })
 }
 
+fn backend_choice(cmd: &str, p: &Value) -> Result<BackendChoice> {
+    BackendChoice::parse(p.get("backend").and_then(Value::as_str)).ok_or_else(|| bad(cmd, "backend must be auto|classical|model"))
+}
+
+fn tag_backend(mut out: Value, used_model: bool, explicit: bool) -> Value {
+    if (used_model || explicit)
+        && let Some(map) = out.as_object_mut()
+    {
+        map.insert("backend".into(), json!(if used_model { "model" } else { "classical" }));
+    }
+    out
+}
+
 /// `select.object` with `"point"`: the Object Finder's object under the point (cached).
 fn object_at_point(s: &mut Session, p: &Value, (x, y): (f32, f32)) -> Result<Value> {
+    let choice = backend_choice("select.object", p)?;
     let all_layers = b(p, "sampleAllLayers", false);
     let d = s.active().ok_or(EngineError::NoDocument)?;
     check_sampled_pixels(&d.doc, d.active_layer, all_layers, Rect::from_xywh(x.floor() as i32, y.floor() as i32, 1, 1))?;
     let target = sampled_target(&d.doc, d.active_layer, all_layers);
     let canvas = d.doc.bounds();
-    let region = match s.object_finder.lookup(&d.doc, target, x, y) {
-        Some(r) => Some(r),
-        None => {
-            let doc = std::sync::Arc::clone(&d.doc);
-            let found = find_object(&doc, d.active_layer, all_layers, x, y).map(std::sync::Arc::new);
-            if let Some(r) = &found {
-                s.object_finder.insert(&doc, target, std::sync::Arc::clone(r));
-            }
-            found
+    let doc_arc = std::sync::Arc::clone(&d.doc);
+    let active_layer = d.active_layer;
+    let model_hit = match (choice, s.segmentation.as_deref()) {
+        (BackendChoice::Classical, _) => None,
+        (_, Some(seg)) => with_doc_sampler(&doc_arc, active_layer, all_layers, |smp, _| ai_segment::try_point(seg, smp, canvas, (x, y))).map(std::sync::Arc::new),
+        (_, None) => None,
+    };
+    if choice == BackendChoice::Model && model_hit.is_none() {
+        return Err(EngineError::Other("AI segmentation model backend is unavailable".into()));
+    }
+    let used_model = model_hit.is_some();
+    let region = match model_hit {
+        Some(r) => {
+            s.object_finder.insert(&doc_arc, target, std::sync::Arc::clone(&r));
+            Some(r)
         }
+        None => match s.object_finder.lookup(&doc_arc, target, x, y) {
+            Some(r) => Some(r),
+            None => {
+                let found = find_object(&doc_arc, active_layer, all_layers, x, y).map(std::sync::Arc::new);
+                if let Some(r) = &found {
+                    s.object_finder.insert(&doc_arc, target, std::sync::Arc::clone(r));
+                }
+                found
+            }
+        },
     };
     // The cache keeps the object as found; Hard Edge only shapes what is stored.
     let region = object_edge(canvas, p, region.as_deref());
@@ -389,7 +420,7 @@ fn object_at_point(s: &mut Session, p: &Value, (x, y): (f32, f32)) -> Result<Val
         let doc = std::sync::Arc::clone(&d.doc);
         s.object_finder.follow(&doc);
     }
-    Ok(out)
+    Ok(tag_backend(out, used_model, p.get("backend").is_some()))
 }
 
 /// The reference application's Object Selection alert in the modes it refuses (#12867).
@@ -416,13 +447,28 @@ fn object_selection(s: &mut Session, p: &Value) -> Result<Value> {
     {
         return object_at_point(s, p, pt);
     }
+    let choice = backend_choice("select.object", p)?;
     let rect = rect_param(p).ok_or_else(|| bad("select.object", "needs \"rect\": [x, y, w, h] or \"point\": [x, y]"))?;
     let all_layers = b(p, "sampleAllLayers", false);
     let d = s.active().ok_or(EngineError::NoDocument)?;
     check_sampled_pixels(&d.doc, d.active_layer, all_layers, rect)?;
     let canvas = d.doc.bounds();
-    let found = with_sampler(s, all_layers, |smp, doc| grabcut::object_select(smp, doc.bounds(), rect, 160_000))?;
-    apply(s, "Object Selection", object_edge(canvas, p, found.as_ref()).as_deref(), mode(p, "replace"))
+    let seg = s.segmentation.clone();
+    let model_found = match (choice, seg.as_deref()) {
+        (BackendChoice::Classical, _) => None,
+        (_, Some(provider)) => with_sampler(s, all_layers, |smp, doc| ai_segment::try_box(provider, smp, doc.bounds(), rect))?,
+        (_, None) => None,
+    };
+    if choice == BackendChoice::Model && model_found.is_none() {
+        return Err(EngineError::Other("AI segmentation model backend is unavailable".into()));
+    }
+    let used_model = model_found.is_some();
+    let found = match model_found {
+        Some(r) => Some(r),
+        None => with_sampler(s, all_layers, |smp, doc| grabcut::object_select(smp, doc.bounds(), rect, 160_000))?,
+    };
+    let out = apply(s, "Object Selection", object_edge(canvas, p, found.as_ref()).as_deref(), mode(p, "replace"))?;
+    Ok(tag_backend(out, used_model, p.get("backend").is_some()))
 }
 
 /// Select Subject's last result (#2865), so running it again on unchanged pixels answers at
@@ -438,6 +484,7 @@ pub struct SubjectCache {
     doc_id: Option<photocraft_doc::DocId>,
     /// The sampled layer; `None` = the composite.
     target: Option<LayerId>,
+    used_model: bool,
     region: Option<std::sync::Arc<Region>>,
 }
 
@@ -451,20 +498,38 @@ impl SubjectCache {
 }
 
 fn select_subject(s: &mut Session, p: &Value) -> Result<Value> {
+    let choice = backend_choice("select.subject", p)?;
     // The selected layer's pixels; the composite only when no pixel layer is selected.
     let all_layers = b(p, "sampleAllLayers", false);
     let d = s.active().ok_or(EngineError::NoDocument)?;
     // What `with_doc_sampler` samples: the active layer's pixels, else the composite.
     let target = d.active_layer.filter(|id| !all_layers && d.doc.layer(*id).and_then(Layer::surface).is_some());
     let c = &s.subject_cache;
-    let hit = c.target == target && c.doc.upgrade().is_some_and(|old| crate::layer_multi_cmds::same_pixels(&old, &d.doc));
-    let region = if hit {
-        c.region.clone()
+    let cache_ok = match choice {
+        BackendChoice::Auto => true,
+        BackendChoice::Classical => !c.used_model,
+        BackendChoice::Model => c.used_model,
+    };
+    let hit = cache_ok && c.target == target && c.doc.upgrade().is_some_and(|old| crate::layer_multi_cmds::same_pixels(&old, &d.doc));
+    let (region, used_model) = if hit {
+        (c.region.clone(), c.used_model)
     } else {
         let doc = std::sync::Arc::clone(&d.doc);
-        let region = with_doc_sampler(&doc, d.active_layer, all_layers, |smp, doc| subject::select_subject(smp, doc.bounds())).map(std::sync::Arc::new);
-        s.subject_cache = SubjectCache { doc: std::sync::Arc::downgrade(&doc), doc_id: Some(doc.id), target, region: region.clone() };
-        region
+        let active_layer = d.active_layer;
+        let model_res = match (choice, s.segmentation.as_deref()) {
+            (BackendChoice::Classical, _) => None,
+            (_, Some(seg)) => with_doc_sampler(&doc, active_layer, all_layers, |smp, d| ai_segment::try_subject(seg, smp, d.bounds())),
+            (_, None) => None,
+        };
+        if choice == BackendChoice::Model && model_res.is_none() {
+            return Err(EngineError::Other("AI segmentation model backend is unavailable".into()));
+        }
+        let is_model = model_res.is_some();
+        let region = model_res
+            .or_else(|| with_doc_sampler(&doc, active_layer, all_layers, |smp, d| subject::select_subject(smp, d.bounds())))
+            .map(std::sync::Arc::new);
+        s.subject_cache = SubjectCache { doc: std::sync::Arc::downgrade(&doc), doc_id: Some(doc.id), target, used_model: is_model, region: region.clone() };
+        (region, is_model)
     };
     let out = apply(s, "Select Subject", region.as_deref(), mode(p, "replace"))?;
     // Follow the document past the selection edit just made (same pixels), so a short history
@@ -475,7 +540,7 @@ fn select_subject(s: &mut Session, p: &Value) -> Result<Value> {
     {
         s.subject_cache.doc = std::sync::Arc::downgrade(&d.doc);
     }
-    Ok(out)
+    Ok(tag_backend(out, used_model, p.get("backend").is_some()))
 }
 
 fn focus_area(s: &mut Session, p: &Value) -> Result<Value> {

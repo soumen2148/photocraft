@@ -9,6 +9,7 @@ use photocraft_doc::{Document, Layer, LayerContent, LayerMask};
 use photocraft_geom::Rect;
 use serde_json::{Value, json};
 
+use crate::ai_segment::{self, BackendChoice};
 use crate::commands::{CommandSpec, layer_param};
 use crate::smartselect_cmds::with_doc_sampler;
 use crate::{EngineError, Result, Session};
@@ -48,21 +49,37 @@ fn subject_area(l: &Layer, canvas: Rect, sample_all: bool) -> Rect {
 }
 
 fn run(s: &mut Session, p: &Value) -> Result<Value> {
+    let choice = BackendChoice::parse(p.get("backend").and_then(Value::as_str))
+        .ok_or_else(|| EngineError::BadParams { cmd: CMD.into(), msg: "backend must be auto|classical|model".into() })?;
     let id = layer_param(s, p)?;
     let doc = &s.active().ok_or(EngineError::NoDocument)?.doc;
     let layer = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
     check(doc, layer).map_err(EngineError::Other)?;
     let sample_all = p.get("sampleAllLayers").and_then(Value::as_bool).unwrap_or(false);
     let refine = p.get("refine").and_then(Value::as_bool).unwrap_or(true);
+    let explicit_backend = p.get("backend").is_some();
+    let seg = s.segmentation.clone();
     let area = subject_area(layer, doc.bounds(), sample_all);
     crate::jobs::edit_job(
         s,
         "Remove Background",
         move |doc, _, ctx| {
             // Cancel reaches the min cuts inside Select Subject, so Esc doesn't wait for them.
-            let found = ctx
-                .stage(0.1, 0.6, "Finding subject", |ctl| with_doc_sampler(doc, Some(id), sample_all, |smp, _| subject::select_subject_with(smp, area, ctl)))
-                .map_err(|_| EngineError::Cancelled)?;
+            let model_found = match (choice, seg.as_deref()) {
+                (BackendChoice::Classical, _) => None,
+                (_, Some(provider)) => with_doc_sampler(doc, Some(id), sample_all, |smp, _| ai_segment::try_subject(provider, smp, area)),
+                (_, None) => None,
+            };
+            if choice == BackendChoice::Model && model_found.is_none() {
+                return Err(EngineError::Other("AI segmentation model backend is unavailable".into()));
+            }
+            let used_model = model_found.is_some();
+            let found = match model_found {
+                Some(r) => Some(r),
+                None => ctx
+                    .stage(0.1, 0.6, "Finding subject", |ctl| with_doc_sampler(doc, Some(id), sample_all, |smp, _| subject::select_subject_with(smp, area, ctl)))
+                    .map_err(|_| EngineError::Cancelled)?,
+            };
             let region = found.ok_or_else(|| EngineError::Other("no subject found".into()))?;
             let mut surface = matting::region_surface(&region);
             if ctx.cancelled() {
@@ -82,9 +99,17 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?.mask = Some(mask);
             doc.selection = None;
             let b = surface.content_bounds();
-            Ok([b.x0, b.y0, b.width() as i32, b.height() as i32])
+            Ok(([b.x0, b.y0, b.width() as i32, b.height() as i32], used_model))
         },
-        move |bounds| json!({ "layer": id.0, "bounds": bounds }),
+        move |(bounds, used_model)| {
+            let mut out = json!({ "layer": id.0, "bounds": bounds });
+            if (used_model || explicit_backend)
+                && let Some(map) = out.as_object_mut()
+            {
+                map.insert("backend".into(), json!(if used_model { "model" } else { "classical" }));
+            }
+            out
+        },
     )
 }
 
