@@ -100,7 +100,7 @@ pub fn default_backend() -> Option<Arc<dyn SegmentationBackend>> {
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{Shutdown, TcpListener};
     use photocraft_engine::ai_segment::{SegmentInput, SegmentationBackend};
     use super::LocalSegmentationClient;
 
@@ -108,18 +108,34 @@ mod tests {
     fn round_trips_binary_mask_over_loopback_http() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let body_len = 4 * 4 * 3;
         let server = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let _ = sock.read(&mut buf).unwrap();
+            // Drain both HTTP headers and the RGB body so Winsock does not emit TCP RST on close.
+            let mut req = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                let n = sock.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n")
+                    && req.len() >= pos + 4 + body_len
+                {
+                    break;
+                }
+            }
             let mask = vec![200u8; 16];
-            let hdr = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", mask.len());
+            let hdr = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", mask.len());
             sock.write_all(hdr.as_bytes()).unwrap();
             sock.write_all(&mask).unwrap();
+            sock.flush().unwrap();
+            let _ = sock.shutdown(Shutdown::Write);
         });
 
         let client = LocalSegmentationClient::new(addr);
-        let rgb = vec![128u8; 4 * 4 * 3];
+        let rgb = vec![128u8; body_len];
         let out = client.segment_subject(SegmentInput { width: 4, height: 4, rgb: &rgb }).unwrap();
         assert_eq!(out, vec![200u8; 16]);
         server.join().unwrap();

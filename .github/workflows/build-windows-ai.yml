@@ -25,11 +25,13 @@ jobs:
 
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: "true"
 
-      - name: Run AI segmentation unit tests
+      - name: Run AI segmentation unit tests (Release profile)
         run: |
-          cargo test -p photocraft-engine ai_segment -- --nocapture
-          cargo test -p photocraft-automation ai_segment -- --nocapture
+          cargo test --release --lib -p photocraft-engine ai_segment -- --nocapture
+          cargo test --release --lib -p photocraft-automation ai_segment -- --nocapture
 
       - name: Build PhotoCraft Desktop & CLI (Release)
         run: cargo build --release -p photocraft -p photocraft-cli --features heif
