@@ -1,0 +1,4 @@
+models/
+.ai_scratch/
+__pycache__/
+*.pyc
